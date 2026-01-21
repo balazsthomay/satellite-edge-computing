@@ -8,6 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Test/coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE/editor
 .claude
 CLAUDE.md
 thoughts/
