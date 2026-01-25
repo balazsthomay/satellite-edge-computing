@@ -13,6 +13,7 @@ from satellite_edge.agents.baselines import (
     PriorityScheduler,
     RoundRobinScheduler,
     GreedyComputeScheduler,
+    ValueDensityScheduler,
     RandomScheduler,
 )
 from satellite_edge.agents.evaluation import (
@@ -116,6 +117,7 @@ def train_and_compare(
         PriorityScheduler(),
         RoundRobinScheduler(),
         GreedyComputeScheduler(),
+        ValueDensityScheduler(),
         RandomScheduler(seed=seed),
     ]
 
