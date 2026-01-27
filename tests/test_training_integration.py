@@ -31,12 +31,12 @@ class TestContentiousBaselines:
 
     def test_contention_config_values(self, contention_configs):
         sat_config, episode_config = contention_configs
-        assert sat_config.compute_capacity == 16.0
-        assert sat_config.task_arrival_rate == 3.0
+        assert sat_config.compute_capacity == 4.0
+        assert sat_config.task_arrival_rate == 12.0
         assert episode_config.max_steps == 500
 
     def test_baselines_produce_different_values(self, contention_configs):
-        """Under contention, different strategies achieve different values."""
+        """Under real contention, different strategies achieve different values."""
         sat_config, _ = contention_configs
         episode_config = EpisodeConfig(max_steps=100)
 
@@ -45,6 +45,7 @@ class TestContentiousBaselines:
             ("FIFO", FIFOScheduler()),
             ("Priority", PriorityScheduler()),
             ("ValueDensity", ValueDensityScheduler()),
+            ("RoundRobin", RoundRobinScheduler()),
             ("Random", RandomScheduler(seed=42)),
         ]:
             result = evaluate_policy(
@@ -57,14 +58,14 @@ class TestContentiousBaselines:
         for name, r in results.items():
             assert r.mean_value > 0.0, f"{name} got zero value"
 
-        # Deterministic baselines should beat Random (which idles)
-        for name in ["FIFO", "Priority", "ValueDensity"]:
-            assert results[name].mean_value > results["Random"].mean_value * 0.9, (
-                f"{name} should beat Random"
-            )
+        # Under real contention, baselines differentiate significantly
+        # ValueDensity should beat FIFO by a large margin
+        assert results["ValueDensity"].mean_value > results["FIFO"].mean_value * 1.5, (
+            "ValueDensity should significantly beat FIFO under contention"
+        )
 
-        # ValueDensity should be competitive with Priority
-        assert results["ValueDensity"].mean_value > results["FIFO"].mean_value * 0.9
+        # ValueDensity should beat RoundRobin
+        assert results["ValueDensity"].mean_value > results["RoundRobin"].mean_value * 0.95
 
     def test_deterministic_baselines_never_idle(self, contention_configs):
         """Deterministic baselines should have zero idle fraction."""
@@ -185,25 +186,21 @@ class TestTrainAndCompare:
 class TestPhase2Deliverable:
     """Verification that Phase 2 success criteria are met.
 
-    With stronger never-idle baselines, PPO exploits subtler advantages:
-    - Contact-window-aware COMPRESSION scheduling
-    - Dynamic priority inversion based on actual queue composition
-    - Power-aware throttling
-    - Non-myopic temporal planning
+    Under real contention (arrival_rate=12, compute=4), scheduling decisions
+    have major impact. Baselines differentiate significantly:
+      ValueDensity > RoundRobin > Priority > GreedyCompute > FIFO
 
-    Under higher contention (more arrivals, less compute), PPO shows
-    clearer improvements as scheduling decisions have larger impact.
+    PPO learns temporal patterns that heuristics miss:
+    - Contact-window-aware COMPRESSION scheduling
+    - Dynamic priority based on actual queue composition
+    - Power-aware throttling
+    - Non-myopic planning across steps
+
+    Expected: PPO beats best baseline (ValueDensity) by >10%.
     """
 
-    def test_ppo_competitive_with_best_baseline(self, tmp_path):
-        """PPO trained under contention is competitive with best baseline.
-
-        With strong never-idle baselines, the margin for improvement is small
-        in moderate contention. PPO should match or slightly beat them.
-
-        Under severe contention (arrival >> compute), priority matters more
-        and PPO can exploit temporal patterns that heuristics miss.
-        """
+    def test_ppo_beats_best_baseline(self, tmp_path):
+        """PPO trained under real contention beats best baseline by >10%."""
         sat_config, episode_config = get_contention_config()
 
         config = PPOConfig(
@@ -253,21 +250,20 @@ class TestPhase2Deliverable:
         best_baseline_name = max(baseline_results, key=lambda k: baseline_results[k].mean_value)
         best_baseline_value = baseline_results[best_baseline_name].mean_value
 
-        # PPO should be competitive: at least 95% of best baseline value
-        # Strong baselines mean PPO converges to similar policies
-        ratio = ppo_result.mean_value / best_baseline_value
-        assert ratio >= 0.95, (
-            f"PPO ({ppo_result.mean_value:.1f}) not competitive with {best_baseline_name} "
-            f"({best_baseline_value:.1f}), ratio={ratio:.2f}"
+        # Under real contention, PPO should beat best baseline by >10%
+        improvement = (ppo_result.mean_value - best_baseline_value) / best_baseline_value * 100
+        assert improvement > 10.0, (
+            f"PPO ({ppo_result.mean_value:.1f}) did not beat {best_baseline_name} "
+            f"({best_baseline_value:.1f}) by >10%, got {improvement:.1f}%"
         )
 
-        # PPO should also beat Random significantly
+        # PPO should crush Random (which idles ~20%)
         random_result = evaluate_policy(
             RandomScheduler(seed=42), n_episodes=20,
             sat_config=sat_config, episode_config=episode_config, seed=1000,
         )
-        assert ppo_result.mean_value > random_result.mean_value * 1.1, (
-            "PPO should beat Random by at least 10%"
+        assert ppo_result.mean_value > random_result.mean_value * 1.5, (
+            "PPO should beat Random by at least 50% under contention"
         )
 
         agent.close()
