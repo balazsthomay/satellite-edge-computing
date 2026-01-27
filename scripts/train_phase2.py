@@ -4,6 +4,9 @@
 Usage:
     uv run scripts/train_phase2.py [--timesteps N] [--n-envs N] [--output DIR]
 
+    # High contention regime (where scheduling decisions matter):
+    uv run scripts/train_phase2.py --arrival-rate 8 --compute 10
+
 Output (default: results/phase2/):
     model/model.zip            # Trained PPO weights
     model/vec_normalize.pkl    # Observation/reward normalization stats
@@ -15,6 +18,7 @@ Output (default: results/phase2/):
 import argparse
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -24,6 +28,7 @@ from satellite_edge.agents.baselines import (
     PriorityScheduler,
     RoundRobinScheduler,
     GreedyComputeScheduler,
+    ValueDensityScheduler,
     RandomScheduler,
 )
 from satellite_edge.agents.evaluation import evaluate_policy, evaluate_ppo_agent, compare_policies
@@ -32,7 +37,25 @@ from satellite_edge.agents.training import get_contention_config
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Phase 2 PPO agent")
+    parser = argparse.ArgumentParser(
+        description="Train Phase 2 PPO agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Contention regimes (ratio = demand / capacity per step):
+  Compute-rich:     --arrival-rate 3 --compute 16   ratio=0.07 (all equal)
+  Mild:             --arrival-rate 8 --compute 6    ratio=0.48 (some diff)
+  Default:          --arrival-rate 12 --compute 4   ratio=1.09 (backlog)
+  Extreme:          --arrival-rate 20 --compute 3   ratio=2.42 (serious)
+
+When ratio > 1, demand exceeds capacity and backlog builds. Tasks decay
+while waiting—ANOMALY loses 59%/step. PPO learns temporal patterns
+(contact windows, power state) that myopic heuristics miss.
+
+Under default contention, expect:
+  ValueDensity > RoundRobin > Priority > GreedyCompute > FIFO
+  PPO beats best baseline by ~50%
+        """,
+    )
     parser.add_argument("--timesteps", type=int, default=300_000,
                         help="Total training timesteps (default: 300k)")
     parser.add_argument("--n-envs", type=int, default=8,
@@ -48,6 +71,15 @@ def parse_args() -> argparse.Namespace:
                         help="Random seed (default: 42)")
     parser.add_argument("--verbose", action="store_true",
                         help="Print training progress")
+
+    # Environment contention parameters
+    parser.add_argument("--arrival-rate", type=float, default=None,
+                        help="Task arrival rate per step (default: 3.0)")
+    parser.add_argument("--compute", type=float, default=None,
+                        help="Compute capacity in TOPS (default: 16.0)")
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="Max steps per episode (default: 500)")
+
     return parser.parse_args()
 
 
@@ -73,11 +105,29 @@ def main():
     print(f"Output: {output_dir}")
     print()
 
+    # Get base config and apply overrides
     sat_config, episode_config = get_contention_config()
+
+    if args.arrival_rate is not None:
+        sat_config = replace(sat_config, task_arrival_rate=args.arrival_rate)
+    if args.compute is not None:
+        sat_config = replace(sat_config, compute_capacity=args.compute)
+    if args.max_steps is not None:
+        episode_config = replace(episode_config, max_steps=args.max_steps)
+
+    # Calculate contention ratio for info
+    # Capacity = TOPS × timestep_duration (tera-ops per step)
+    # Demand = arrivals × avg_task_cost (tera-ops per step)
+    avg_task_cost = 3.625  # weighted average of task compute costs
+    capacity_per_step = sat_config.compute_capacity * episode_config.timestep_duration
+    demand_per_step = sat_config.task_arrival_rate * avg_task_cost
+    contention_ratio = demand_per_step / capacity_per_step
 
     print(f"Environment: {sat_config.compute_capacity} TOPS, "
           f"{sat_config.task_arrival_rate} tasks/step, "
           f"{episode_config.max_steps} steps/episode")
+    print(f"Contention ratio: {contention_ratio:.2f} "
+          f"({'backlog builds' if contention_ratio > 1 else 'compute-rich'})")
     print()
 
     # Configure PPO
@@ -140,6 +190,7 @@ def main():
         ("Priority", PriorityScheduler()),
         ("RoundRobin", RoundRobinScheduler()),
         ("GreedyCompute", GreedyComputeScheduler()),
+        ("ValueDensity", ValueDensityScheduler()),
         ("Random", RandomScheduler(seed=args.seed)),
     ]
 
@@ -167,19 +218,29 @@ def main():
     # Compare
     comparison = compare_policies(all_results)
 
-    # Summary
+    # Find best baseline
+    baseline_names = [name for name, _ in baselines]
+    best_baseline = max(
+        baseline_names,
+        key=lambda n: comparison[f"{n}Scheduler" if n != "Random" else "RandomScheduler"]["mean_value"]
+    )
+    best_baseline_key = f"{best_baseline}Scheduler" if best_baseline != "Random" else "RandomScheduler"
+    best_val = comparison[best_baseline_key]["mean_value"]
+
     fifo_val = comparison["FIFOScheduler"]["mean_value"]
     ppo_val = comparison["PPO"]["mean_value"]
-    improvement = (ppo_val - fifo_val) / fifo_val * 100
+    improvement_vs_fifo = (ppo_val - fifo_val) / fifo_val * 100
+    improvement_vs_best = (ppo_val - best_val) / best_val * 100
 
     print()
     print("=" * 60)
     print("RESULTS")
     print("=" * 60)
-    print(f"  PPO vs FIFO: +{improvement:.1f}%")
-    print(f"  PPO value:   {ppo_val:.1f}")
-    print(f"  FIFO value:  {fifo_val:.1f}")
-    print(f"  Threshold:   >10%  {'PASS' if improvement > 10 else 'FAIL'}")
+    print(f"  Best baseline: {best_baseline} ({best_val:.1f})")
+    print(f"  PPO vs best:   {improvement_vs_best:+.1f}%")
+    print(f"  PPO vs FIFO:   {improvement_vs_fifo:+.1f}%")
+    print(f"  PPO value:     {ppo_val:.1f}")
+    print(f"  Threshold:     >10% vs best  {'PASS' if improvement_vs_best > 10 else 'FAIL'}")
 
     # Save comparison
     comparison_path = output_dir / "comparison.json"
@@ -200,7 +261,8 @@ def main():
         f.write(f"Environment:\n")
         f.write(f"  Compute: {sat_config.compute_capacity} TOPS\n")
         f.write(f"  Task arrival: {sat_config.task_arrival_rate}/step\n")
-        f.write(f"  Episode: {episode_config.max_steps} steps\n\n")
+        f.write(f"  Episode: {episode_config.max_steps} steps\n")
+        f.write(f"  Contention ratio: {contention_ratio:.2f}\n\n")
         f.write(f"Results ({args.eval_episodes} eval episodes):\n")
         f.write(f"  {'Policy':20s}  {'Value':>10s}  {'± Std':>8s}  {'vs FIFO':>8s}\n")
         f.write(f"  {'-' * 52}\n")
@@ -208,7 +270,8 @@ def main():
             imp = metrics.get("improvement_vs_fifo_pct", 0)
             f.write(f"  {name:20s}  {metrics['mean_value']:10.1f}  "
                     f"{metrics['std_value']:8.1f}  {imp:+7.1f}%\n")
-        f.write(f"\n  PPO vs FIFO: +{improvement:.1f}% ({'PASS' if improvement > 10 else 'FAIL'})\n")
+        f.write(f"\n  Best baseline: {best_baseline}\n")
+        f.write(f"  PPO vs best: {improvement_vs_best:+.1f}% ({'PASS' if improvement_vs_best > 10 else 'FAIL'})\n")
 
     print(f"\nSaved: {comparison_path}")
     print(f"Saved: {summary_path}")
