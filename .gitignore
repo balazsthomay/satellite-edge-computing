@@ -18,6 +18,10 @@ htmlcov/
 results/
 logs/
 
+# Model weights
+*.pt
+*.onnx
+
 # IDE/editor
 .claude
 CLAUDE.md

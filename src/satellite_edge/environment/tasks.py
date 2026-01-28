@@ -12,18 +12,20 @@ class TaskType(IntEnum):
     Each task type has different compute requirements and value profiles.
     Ordered roughly by typical priority in disaster response scenarios.
     """
-    DETECTION = 0       # Object detection (ships, vehicles, aircraft)
-    ANOMALY = 1         # Anomaly detection (fires, floods, changes)
-    CLOUD_MASK = 2      # Cloud masking for downstream tasks
-    COMPRESSION = 3     # Intelligent compression before downlink
+
+    DETECTION = 0  # Object detection (ships, vehicles, aircraft)
+    ANOMALY = 1  # Anomaly detection (fires, floods, changes)
+    CLOUD_MASK = 2  # Cloud masking for downstream tasks
+    COMPRESSION = 3  # Intelligent compression before downlink
 
 
 @dataclass
 class TaskSpec:
     """Specification for a task type's resource requirements."""
-    compute_cost: float      # TOPS required to complete
+
+    compute_cost: float  # TOPS required to complete
     memory_footprint: float  # GB of buffer space needed
-    base_value: float        # Nominal value when completed
+    base_value: float  # Nominal value when completed
     deadline_sensitivity: float  # How fast value decays (0=none, 1=linear)
 
 
@@ -63,18 +65,19 @@ TASK_SPECS: dict[TaskType, TaskSpec] = {
 @dataclass
 class Task:
     """A single processing task in the satellite's queue."""
+
     task_type: TaskType
-    tile_id: int                    # Which image tile this task processes
-    arrival_time: float             # Simulation time when task arrived
-    priority_boost: float = 1.0     # Multiplier for special events (e.g., disaster)
-    progress: float = 0.0           # Fraction of compute completed [0, 1]
+    tile_id: int  # Which image tile this task processes
+    arrival_time: float  # Simulation time when task arrived
+    priority_boost: float = 1.0  # Multiplier for special events (e.g., disaster)
+    progress: float = 0.0  # Fraction of compute completed [0, 1]
 
     _id: int = field(default_factory=lambda: Task._next_id())
     _id_counter: int = field(default=0, init=False, repr=False)
 
     @staticmethod
     def _next_id() -> int:
-        Task._id_counter = getattr(Task, '_id_counter', 0) + 1
+        Task._id_counter = getattr(Task, "_id_counter", 0) + 1
         return Task._id_counter
 
     @property
@@ -109,6 +112,61 @@ class Task:
     @property
     def is_complete(self) -> bool:
         return self.progress >= 1.0 - 1e-9
+
+
+@dataclass
+class ImageTask(Task):
+    """Task with associated satellite image tile data.
+
+    Extends Task with image-derived metadata for value estimation.
+    Used when processing real satellite imagery through the scheduler.
+    """
+
+    tile_path: str | None = None  # Path to GeoTIFF tile
+    cloud_fraction: float = 0.0  # Fraction of tile covered by clouds [0, 1]
+    entropy_score: float = 0.5  # Information content / texture [0, 1]
+    edge_density: float = 0.5  # Feature richness / detection potential [0, 1]
+
+    @property
+    def image_quality_multiplier(self) -> float:
+        """Compute value multiplier based on image content.
+
+        Different task types benefit from different image characteristics:
+        - DETECTION: Penalize clouds, reward edge density (objects to detect)
+        - ANOMALY: Penalize clouds, reward entropy (unusual patterns)
+        - CLOUD_MASK: Reward clouds (more to mask = more useful)
+        - COMPRESSION: Reward entropy (more information = better candidate)
+
+        Returns:
+            Multiplier in [0.1, 1.0] for task value.
+        """
+        cloud = self.cloud_fraction
+        entropy = self.entropy_score
+        edges = self.edge_density
+
+        if self.task_type == TaskType.DETECTION:
+            # Cloudy images are useless for detection
+            # High edge density = more potential targets
+            multiplier = (1 - cloud) * (0.3 * entropy + 0.7 * edges)
+        elif self.task_type == TaskType.ANOMALY:
+            # Similar to detection but entropy matters more
+            multiplier = (1 - cloud) * (0.5 * entropy + 0.5 * edges)
+        elif self.task_type == TaskType.CLOUD_MASK:
+            # More clouds = more value for cloud masking task
+            multiplier = 0.2 + 0.8 * cloud
+        else:  # COMPRESSION
+            # Higher entropy = better compression candidate
+            multiplier = 0.3 + 0.7 * entropy
+
+        return max(multiplier, 0.1)  # Floor at 10%
+
+    def current_value(self, current_time: float) -> float:
+        """Calculate task value with time decay and image quality.
+
+        Extends parent method by applying image quality multiplier.
+        """
+        base_value = super().current_value(current_time)
+        return base_value * self.image_quality_multiplier
 
 
 class TaskQueue:

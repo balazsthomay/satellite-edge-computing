@@ -1,6 +1,6 @@
 """Gymnasium-compatible satellite environment."""
 
 from satellite_edge.environment.satellite_env import SatelliteEnv
-from satellite_edge.environment.tasks import Task, TaskType, TaskQueue
+from satellite_edge.environment.tasks import ImageTask, Task, TaskQueue, TaskType
 
-__all__ = ["SatelliteEnv", "Task", "TaskType", "TaskQueue"]
+__all__ = ["SatelliteEnv", "Task", "ImageTask", "TaskType", "TaskQueue"]
