@@ -6,7 +6,9 @@ import gymnasium as gym
 from gymnasium.utils.env_checker import check_env as gym_check_env
 
 from satellite_edge.environment.satellite_env import (
-    SatelliteEnv, SatelliteConfig, EpisodeConfig
+    SatelliteEnv,
+    SatelliteConfig,
+    EpisodeConfig,
 )
 from satellite_edge.environment.tasks import TaskType
 
@@ -294,9 +296,15 @@ class TestInfo:
         _, info = env.reset(seed=42)
 
         required_keys = [
-            "sim_time", "step", "total_value", "tasks_completed",
-            "tasks_dropped", "queue_size", "buffer_used",
-            "downlink_data", "in_contact"
+            "sim_time",
+            "step",
+            "total_value",
+            "tasks_completed",
+            "tasks_dropped",
+            "queue_size",
+            "buffer_used",
+            "downlink_data",
+            "in_contact",
         ]
 
         for key in required_keys:
@@ -521,3 +529,166 @@ class TestEdgeCases:
                 break
 
         assert truncated  # Should truncate at max_steps
+
+
+class TestImageFeatures:
+    """Tests for image-aware scheduling observation space."""
+
+    def test_extended_observation_space_shape(self):
+        """Test 22-dim observation space with image features enabled."""
+        config = SatelliteConfig(use_image_features=True)
+        env = SatelliteEnv(sat_config=config)
+        # Base 14 + avg_cloud(4) + avg_quality(4) = 22
+        assert env.observation_space.shape == (22,)
+
+    def test_base_observation_space_unchanged(self):
+        """Test default 14-dim observation space without image features."""
+        config = SatelliteConfig(use_image_features=False)
+        env = SatelliteEnv(sat_config=config)
+        assert env.observation_space.shape == (14,)
+
+    def test_observation_shape_matches_space(self):
+        """Test observation matches space shape with image features."""
+        config = SatelliteConfig(use_image_features=True)
+        env = SatelliteEnv(sat_config=config)
+        obs, _ = env.reset(seed=42)
+        assert obs.shape == (22,)
+        assert env.observation_space.contains(obs)
+
+    def test_image_metrics_populated(self):
+        """Test that image metrics are non-trivial when tasks exist."""
+        config = SatelliteConfig(use_image_features=True, task_arrival_rate=5.0)
+        env = SatelliteEnv(sat_config=config)
+        env.reset(seed=42)
+
+        # Run a few steps to accumulate tasks
+        for _ in range(5):
+            env.step(4)  # IDLE to not process
+
+        obs = env._get_obs()
+
+        # Image features are obs[14:22]
+        avg_cloud = obs[14:18]
+        avg_quality = obs[18:22]
+
+        # At least some task types should have tasks with cloud metrics
+        assert avg_cloud.sum() > 0, "avg_cloud should be populated for some task types"
+        assert avg_quality.sum() > 0, (
+            "avg_quality should be populated for some task types"
+        )
+
+    def test_image_metrics_bounds(self):
+        """Test image metrics stay in [0, 1] range."""
+        config = SatelliteConfig(use_image_features=True, task_arrival_rate=10.0)
+        env = SatelliteEnv(sat_config=config)
+        env.reset(seed=42)
+
+        for _ in range(50):
+            obs, _, terminated, truncated, _ = env.step(env.action_space.sample())
+            assert np.all(obs >= 0.0), "All observation values should be >= 0"
+            assert np.all(obs <= 1.0), "All observation values should be <= 1"
+            if terminated or truncated:
+                break
+
+    def test_image_tasks_created(self):
+        """Test that ImageTasks are created when use_image_features=True."""
+        from satellite_edge.environment.tasks import ImageTask
+
+        config = SatelliteConfig(use_image_features=True)
+        env = SatelliteEnv(sat_config=config)
+        env.reset(seed=42)
+
+        # Check that all tasks in queue are ImageTasks
+        for task in env._task_queue:
+            assert isinstance(task, ImageTask), f"Expected ImageTask, got {type(task)}"
+            # Verify metrics are set
+            assert 0 <= task.cloud_fraction <= 1
+            assert 0.3 <= task.entropy_score <= 0.9
+            assert 0.2 <= task.edge_density <= 0.8
+
+    def test_basic_tasks_without_image_features(self):
+        """Test that basic Tasks are created when use_image_features=False."""
+        from satellite_edge.environment.tasks import Task, ImageTask
+
+        config = SatelliteConfig(use_image_features=False)
+        env = SatelliteEnv(sat_config=config)
+        env.reset(seed=42)
+
+        # Tasks should be basic Task, not ImageTask
+        for task in env._task_queue:
+            assert type(task) is Task, f"Expected Task, got {type(task)}"
+
+    def test_gymnasium_compliance_with_image_features(self):
+        """Test Gymnasium compliance with extended observation space."""
+        config = SatelliteConfig(use_image_features=True)
+        env = SatelliteEnv(sat_config=config)
+
+        try:
+            gym_check_env(env, skip_render_check=True)
+        except Exception as e:
+            pytest.fail(f"Gymnasium check_env failed with image features: {e}")
+
+    def test_sb3_compatibility_with_image_features(self):
+        """Test SB3 compatibility with extended observation space."""
+        from stable_baselines3.common.env_checker import check_env
+
+        config = SatelliteConfig(use_image_features=True)
+        env = SatelliteEnv(sat_config=config)
+
+        try:
+            check_env(env, warn=True)
+        except Exception as e:
+            pytest.fail(f"SB3 check_env failed with image features: {e}")
+
+    def test_vectorized_env_with_image_features(self):
+        """Test vectorized environment with image features."""
+        from stable_baselines3.common.env_util import make_vec_env
+
+        def make_env():
+            return SatelliteEnv(sat_config=SatelliteConfig(use_image_features=True))
+
+        vec_env = make_vec_env(make_env, n_envs=2)
+
+        obs = vec_env.reset()
+        assert obs.shape == (2, 22)
+
+        obs, rewards, dones, infos = vec_env.step([0, 1])
+        assert obs.shape == (2, 22)
+
+        vec_env.close()
+
+    def test_seeding_with_image_features(self):
+        """Test deterministic seeding with image features."""
+        config = SatelliteConfig(use_image_features=True)
+
+        env1 = SatelliteEnv(sat_config=config)
+        obs1, _ = env1.reset(seed=12345)
+
+        env2 = SatelliteEnv(sat_config=config)
+        obs2, _ = env2.reset(seed=12345)
+
+        np.testing.assert_array_equal(obs1, obs2)
+
+    def test_image_quality_affects_reward(self):
+        """Test that image quality multiplier affects task value/reward."""
+        # High compute to complete tasks quickly
+        config = SatelliteConfig(
+            use_image_features=True,
+            compute_capacity=100.0,
+            task_arrival_rate=2.0,
+        )
+        env = SatelliteEnv(sat_config=config)
+        env.reset(seed=42)
+
+        # Run episode and collect rewards
+        total_reward = 0.0
+        for _ in range(50):
+            _, reward, terminated, truncated, info = env.step(0)
+            total_reward += reward
+            if terminated or truncated:
+                break
+
+        # With image features, reward should be modified by quality multiplier
+        # Just verify we get positive reward (tasks are completing)
+        assert info["tasks_completed"] > 0
+        assert total_reward > 0

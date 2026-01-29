@@ -251,3 +251,52 @@ class TaskQueue:
     def clear(self) -> None:
         """Remove all tasks from queue."""
         self._tasks.clear()
+
+    def get_avg_cloud_by_type(self) -> np.ndarray:
+        """Return mean cloud_fraction per task type.
+
+        For ImageTasks, returns the average cloud_fraction. For regular Tasks,
+        assumes cloud_fraction = 0.0 (clear sky).
+
+        Returns:
+            Array of shape (num_task_types,) with mean cloud fraction per type.
+        """
+        cloud_sums = np.zeros(len(TaskType), dtype=np.float32)
+        counts = np.zeros(len(TaskType), dtype=np.float32)
+
+        for task in self._tasks:
+            idx = int(task.task_type)
+            counts[idx] += 1
+            if isinstance(task, ImageTask):
+                cloud_sums[idx] += task.cloud_fraction
+            # Regular Task defaults to 0.0 (clear)
+
+        # Avoid division by zero
+        with np.errstate(invalid="ignore"):
+            result = np.where(counts > 0, cloud_sums / counts, 0.0)
+        return result.astype(np.float32)
+
+    def get_avg_quality_by_type(self) -> np.ndarray:
+        """Return mean image_quality_multiplier per task type.
+
+        For ImageTasks, returns the average image_quality_multiplier.
+        For regular Tasks, assumes quality = 1.0 (full value).
+
+        Returns:
+            Array of shape (num_task_types,) with mean quality per type.
+        """
+        quality_sums = np.zeros(len(TaskType), dtype=np.float32)
+        counts = np.zeros(len(TaskType), dtype=np.float32)
+
+        for task in self._tasks:
+            idx = int(task.task_type)
+            counts[idx] += 1
+            if isinstance(task, ImageTask):
+                quality_sums[idx] += task.image_quality_multiplier
+            else:
+                quality_sums[idx] += 1.0  # Regular Task has full quality
+
+        # Avoid division by zero
+        with np.errstate(invalid="ignore"):
+            result = np.where(counts > 0, quality_sums / counts, 0.0)
+        return result.astype(np.float32)
