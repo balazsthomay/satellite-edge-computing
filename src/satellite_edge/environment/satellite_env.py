@@ -141,6 +141,15 @@ class SatelliteEnv(gym.Env):
         self._tasks_dropped: int = 0
         self._downlink_data: float = 0.0
 
+        # Extended metrics for Phase 4 evaluation
+        self._task_completion_records: list[dict] = []
+        self._completions_by_type: dict[int, int] = {}
+        self._value_by_type: dict[int, float] = {}
+        self._buffer_overflow_count: int = 0
+        self._contact_time_used: float = 0.0
+        self._contact_time_available: float = 0.0
+        self._potential_value: float = 0.0  # Value if all tasks completed instantly
+
         # Contact state tracking
         self._in_contact: bool = False
         self._contact_start_time: float = 0.0
@@ -227,6 +236,10 @@ class SatelliteEnv(gym.Env):
 
     def _get_info(self) -> dict[str, Any]:
         """Build info dict with metrics."""
+        contact_efficiency = 0.0
+        if self._contact_time_available > 1e-6:
+            contact_efficiency = self._contact_time_used / self._contact_time_available
+
         return {
             "sim_time": self._sim_time,
             "step": self._step_count,
@@ -237,6 +250,15 @@ class SatelliteEnv(gym.Env):
             "buffer_used": self._buffer_used,
             "downlink_data": self._downlink_data,
             "in_contact": self._in_contact,
+            # Extended metrics for Phase 4 evaluation
+            "task_completions": self._task_completion_records,
+            "completions_by_type": self._completions_by_type.copy(),
+            "value_by_type": self._value_by_type.copy(),
+            "buffer_overflows": self._buffer_overflow_count,
+            "contact_time_used": self._contact_time_used,
+            "contact_time_available": self._contact_time_available,
+            "contact_efficiency": contact_efficiency,
+            "potential_value": self._potential_value,
         }
 
     def reset(
@@ -258,6 +280,15 @@ class SatelliteEnv(gym.Env):
         self._tasks_completed = 0
         self._tasks_dropped = 0
         self._downlink_data = 0.0
+
+        # Reset extended metrics
+        self._task_completion_records = []
+        self._completions_by_type = {}
+        self._value_by_type = {}
+        self._buffer_overflow_count = 0
+        self._contact_time_used = 0.0
+        self._contact_time_available = 0.0
+        self._potential_value = 0.0
 
         # Reset contact tracking
         self._in_contact = False
@@ -324,6 +355,8 @@ class SatelliteEnv(gym.Env):
 
         if self._task_queue.add(task):
             self._buffer_used += task.spec.memory_footprint
+            # Track potential value (value if completed instantly)
+            self._potential_value += task.current_value(self._sim_time)
             return task
 
         self._tasks_dropped += 1
@@ -386,6 +419,26 @@ class SatelliteEnv(gym.Env):
             self._tasks_completed += 1
             self._buffer_used -= task.spec.memory_footprint
 
+            # Track completion record for latency analysis
+            task_type_int = int(task.task_type)
+            self._task_completion_records.append(
+                {
+                    "task_type": task_type_int,
+                    "arrival_time": task.arrival_time,
+                    "completion_time": self._sim_time,
+                    "priority": task.priority_boost,
+                    "value": value,
+                }
+            )
+
+            # Track per-type completions and value
+            self._completions_by_type[task_type_int] = (
+                self._completions_by_type.get(task_type_int, 0) + 1
+            )
+            self._value_by_type[task_type_int] = (
+                self._value_by_type.get(task_type_int, 0.0) + value
+            )
+
         # Prevent floating point precision issues
         self._buffer_used = max(0.0, self._buffer_used)
 
@@ -419,6 +472,14 @@ class SatelliteEnv(gym.Env):
             )  # Cap at half buffer
             self._buffer_used = max(0, self._buffer_used - actual_downlink)
             self._downlink_data += actual_downlink
+
+            # Track contact time for efficiency calculation
+            self._contact_time_available += self.episode_config.timestep_duration
+            if actual_downlink > 0:
+                # Proportion of timestep actually used for downlink
+                self._contact_time_used += self.episode_config.timestep_duration * (
+                    actual_downlink / data_downlinked
+                )
 
             # Small reward for successful downlink
             reward += actual_downlink * 0.1
@@ -459,6 +520,7 @@ class SatelliteEnv(gym.Env):
             overflow = self._buffer_used - self.sat_config.buffer_capacity
             overflow_penalty = -overflow * 2.0
             self._buffer_used = self.sat_config.buffer_capacity
+            self._buffer_overflow_count += 1
 
         # Total reward
         reward = task_reward + contact_reward + overflow_penalty
