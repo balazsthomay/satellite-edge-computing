@@ -6,8 +6,17 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
-from satellite_edge.environment.tasks import Task, TaskType, TaskQueue, TASK_SPECS
-from satellite_edge.orbital.orbit_propagator import SimplifiedOrbitModel, OrbitPropagator
+from satellite_edge.environment.tasks import (
+    Task,
+    ImageTask,
+    TaskType,
+    TaskQueue,
+    TASK_SPECS,
+)
+from satellite_edge.orbital.orbit_propagator import (
+    SimplifiedOrbitModel,
+    OrbitPropagator,
+)
 from satellite_edge.orbital.ground_station import GroundStationNetwork
 
 
@@ -20,21 +29,26 @@ class SatelliteConfig:
     - Typical LEO sat: 256-512 GB onboard storage
     - Power budget: 100-500W depending on solar/battery
     """
-    compute_capacity: float = 32.0    # TOPS available per timestep
-    buffer_capacity: float = 256.0    # GB onboard storage
-    power_capacity: float = 300.0     # Watts available
-    power_per_tops: float = 5.0       # W per TOPS used
+
+    compute_capacity: float = 32.0  # TOPS available per timestep
+    buffer_capacity: float = 256.0  # GB onboard storage
+    power_capacity: float = 300.0  # Watts available
+    power_per_tops: float = 5.0  # W per TOPS used
 
     # Task generation parameters
-    task_arrival_rate: float = 0.5    # Mean tasks per timestep
-    priority_event_prob: float = 0.05 # Probability of priority boost event
+    task_arrival_rate: float = 0.5  # Mean tasks per timestep
+    priority_event_prob: float = 0.05  # Probability of priority boost event
+
+    # Image-aware scheduling
+    use_image_features: bool = False  # Extend obs space with image metrics
 
 
 @dataclass
 class EpisodeConfig:
     """Configuration for episode structure."""
-    max_steps: int = 1000             # Steps per episode
-    timestep_duration: float = 10.0   # Seconds per simulation step
+
+    max_steps: int = 1000  # Steps per episode
+    timestep_duration: float = 10.0  # Seconds per simulation step
     use_full_orbit_model: bool = False  # Use Skyfield vs simplified
 
 
@@ -44,7 +58,8 @@ class SatelliteEnv(gym.Env):
     The agent must allocate limited onboard compute across competing CV tasks
     while managing buffer constraints and ground station downlink windows.
 
-    Observation Space:
+    Observation Space (14 dims, or 22 if use_image_features=True):
+        Base features (14 dims):
         - compute_available: Fraction of compute budget remaining [0, 1]
         - buffer_usage: Fraction of buffer capacity used [0, 1]
         - queue_depths: Tasks per type, normalized [0, 1] x num_task_types
@@ -53,6 +68,10 @@ class SatelliteEnv(gym.Env):
         - time_to_contact: Normalized time until next contact [0, 1]
         - contact_duration: Normalized remaining contact time [0, 1]
         - power_available: Fraction of power budget remaining [0, 1]
+
+        Image features (8 dims, when use_image_features=True):
+        - avg_cloud: Mean cloud_fraction per task type [0, 1] x num_task_types
+        - avg_quality: Mean image_quality_multiplier per task type [0, 1] x num_task_types
 
     Action Space:
         Discrete(num_task_types + 1):
@@ -92,10 +111,15 @@ class SatelliteEnv(gym.Env):
         self._num_task_types = len(TaskType)
 
         # Observation: flat Box for SB3 compatibility
-        # [compute_avail, buffer_usage, queue_depths x4, queue_compute x4,
-        #  ground_contact, time_to_contact, contact_duration, power_avail]
+        # Base: [compute_avail, buffer_usage, queue_depths x4, queue_compute x4,
+        #        ground_contact, time_to_contact, contact_duration, power_avail]
         # = 2 + 2*4 + 4 = 14
-        obs_dim = 2 + 2 * self._num_task_types + 4
+        # Extended (use_image_features=True): + avg_cloud x4 + avg_quality x4 = 22
+        base_obs_dim = 2 + 2 * self._num_task_types + 4
+        if self.sat_config.use_image_features:
+            obs_dim = base_obs_dim + 2 * self._num_task_types  # +8 for image features
+        else:
+            obs_dim = base_obs_dim
         self.observation_space = spaces.Box(
             low=0.0, high=1.0, shape=(obs_dim,), dtype=np.float32
         )
@@ -123,9 +147,26 @@ class SatelliteEnv(gym.Env):
         self._current_station = None
 
     def _get_obs(self) -> np.ndarray:
-        """Build observation vector."""
+        """Build observation vector.
+
+        Base observation (14 dims):
+            obs[0]     compute_avail         fraction of compute capacity remaining
+            obs[1]     buffer_usage          fraction of buffer capacity used
+            obs[2:6]   queue_depths[4]       task count per type / max_queue_size
+            obs[6:10]  queue_compute[4]      total compute per type / (capacity * 10)
+            obs[10]    ground_contact        1.0 if in contact, 0.0 else
+            obs[11]    time_to_contact       normalized by orbital period
+            obs[12]    contact_duration      fraction of remaining contact time
+            obs[13]    power_avail           fraction of power capacity remaining
+
+        Extended observation (22 dims, when use_image_features=True):
+            obs[14:18] avg_cloud[4]          mean cloud_fraction per task type [0,1]
+            obs[18:22] avg_quality[4]        mean image_quality_multiplier per task type [0,1]
+        """
         # Compute availability (replenishes each step)
-        compute_avail = 1.0 - self._compute_used_this_step / self.sat_config.compute_capacity
+        compute_avail = (
+            1.0 - self._compute_used_this_step / self.sat_config.compute_capacity
+        )
 
         # Buffer usage
         buffer_usage = self._buffer_used / self.sat_config.buffer_capacity
@@ -145,7 +186,7 @@ class SatelliteEnv(gym.Env):
             time_to_contact = 0.0
         else:
             time_to_next = self._orbit.get_time_to_next_contact(self._sim_time)
-            orbital_period = getattr(self._orbit, 'orbital_period', 5400.0)
+            orbital_period = getattr(self._orbit, "orbital_period", 5400.0)
             time_to_contact = np.clip(time_to_next / orbital_period, 0, 1)
 
         # Contact duration remaining (if in contact)
@@ -159,7 +200,8 @@ class SatelliteEnv(gym.Env):
         # Power availability
         power_avail = 1.0 - self._power_used_this_step / self.sat_config.power_capacity
 
-        obs = np.array([
+        # Build base observation
+        base_obs = [
             compute_avail,
             buffer_usage,
             *queue_depths,
@@ -168,7 +210,18 @@ class SatelliteEnv(gym.Env):
             time_to_contact,
             contact_duration,
             power_avail,
-        ], dtype=np.float32)
+        ]
+
+        # Add image features if enabled
+        if self.sat_config.use_image_features:
+            avg_cloud = self._task_queue.get_avg_cloud_by_type()
+            avg_quality = self._task_queue.get_avg_quality_by_type()
+            obs = np.array(
+                [*base_obs, *avg_cloud, *avg_quality],
+                dtype=np.float32,
+            )
+        else:
+            obs = np.array(base_obs, dtype=np.float32)
 
         return np.clip(obs, 0.0, 1.0)
 
@@ -219,7 +272,11 @@ class SatelliteEnv(gym.Env):
         return self._get_obs(), self._get_info()
 
     def _generate_task(self) -> Task | None:
-        """Generate a new random task and add to queue."""
+        """Generate a new random task and add to queue.
+
+        When use_image_features is enabled, creates ImageTask with synthetic
+        image metrics. Otherwise creates basic Task.
+        """
         # Sample task type (weighted towards detection and compression)
         weights = [0.35, 0.15, 0.20, 0.30]  # DET, ANO, CLOUD, COMP
         task_type = TaskType(self.np_random.choice(len(TaskType), p=weights))
@@ -229,15 +286,39 @@ class SatelliteEnv(gym.Env):
         if self.np_random.random() < self.sat_config.priority_event_prob:
             priority = self.np_random.uniform(2.0, 5.0)
 
-        task = Task(
-            task_type=task_type,
-            tile_id=self.np_random.integers(0, 10000),
-            arrival_time=self._sim_time,
-            priority_boost=priority,
-        )
+        tile_id = self.np_random.integers(0, 10000)
+
+        if self.sat_config.use_image_features:
+            # Generate synthetic image metrics
+            # Cloud fraction: Beta(2, 5) skews toward clear sky (~0.28 mean)
+            cloud_fraction = float(self.np_random.beta(2, 5))
+            # Entropy: Uniform spread representing varied scene complexity
+            entropy_score = float(self.np_random.uniform(0.3, 0.9))
+            # Edge density: Uniform spread for feature richness
+            edge_density = float(self.np_random.uniform(0.2, 0.8))
+
+            task = ImageTask(
+                task_type=task_type,
+                tile_id=tile_id,
+                arrival_time=self._sim_time,
+                priority_boost=priority,
+                cloud_fraction=cloud_fraction,
+                entropy_score=entropy_score,
+                edge_density=edge_density,
+            )
+        else:
+            task = Task(
+                task_type=task_type,
+                tile_id=tile_id,
+                arrival_time=self._sim_time,
+                priority_boost=priority,
+            )
 
         # Check buffer capacity
-        if self._buffer_used + task.spec.memory_footprint > self.sat_config.buffer_capacity:
+        if (
+            self._buffer_used + task.spec.memory_footprint
+            > self.sat_config.buffer_capacity
+        ):
             self._tasks_dropped += 1
             return None
 
@@ -291,7 +372,9 @@ class SatelliteEnv(gym.Env):
                 power_remaining -= tops_used * self.sat_config.power_per_tops
 
         # Track resource usage
-        self._compute_used_this_step = self.sat_config.compute_capacity - compute_remaining
+        self._compute_used_this_step = (
+            self.sat_config.compute_capacity - compute_remaining
+        )
         self._power_used_this_step = self.sat_config.power_capacity - power_remaining
 
         # Collect completed tasks and calculate reward
@@ -328,8 +411,12 @@ class SatelliteEnv(gym.Env):
         if in_contact and station is not None:
             # Downlink processed data (compression tasks)
             downlink_rate = station.downlink_rate  # Gbps
-            data_downlinked = downlink_rate * self.episode_config.timestep_duration / 8  # GB
-            actual_downlink = min(data_downlinked, self._buffer_used * 0.5)  # Cap at half buffer
+            data_downlinked = (
+                downlink_rate * self.episode_config.timestep_duration / 8
+            )  # GB
+            actual_downlink = min(
+                data_downlinked, self._buffer_used * 0.5
+            )  # Cap at half buffer
             self._buffer_used = max(0, self._buffer_used - actual_downlink)
             self._downlink_data += actual_downlink
 

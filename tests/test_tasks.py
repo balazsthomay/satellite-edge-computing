@@ -4,7 +4,12 @@ import numpy as np
 import pytest
 
 from satellite_edge.environment.tasks import (
-    Task, TaskType, TaskQueue, TaskSpec, TASK_SPECS
+    Task,
+    ImageTask,
+    TaskType,
+    TaskQueue,
+    TaskSpec,
+    TASK_SPECS,
 )
 
 
@@ -253,16 +258,15 @@ class TestTaskQueue:
         total_memory = queue.get_total_memory()
 
         expected = (
-            TASK_SPECS[TaskType.DETECTION].memory_footprint +
-            TASK_SPECS[TaskType.ANOMALY].memory_footprint
+            TASK_SPECS[TaskType.DETECTION].memory_footprint
+            + TASK_SPECS[TaskType.ANOMALY].memory_footprint
         )
         assert total_memory == pytest.approx(expected)
 
     def test_iteration(self):
         queue = TaskQueue()
         tasks = [
-            Task(TaskType.DETECTION, tile_id=i, arrival_time=float(i))
-            for i in range(3)
+            Task(TaskType.DETECTION, tile_id=i, arrival_time=float(i)) for i in range(3)
         ]
         for task in tasks:
             queue.add(task)
@@ -301,3 +305,222 @@ class TestTaskQueue:
         # All zeros when empty
         for task_type in TaskType:
             assert oldest[task_type] == 0.0
+
+    def test_get_avg_cloud_by_type_with_image_tasks(self):
+        """Test average cloud fraction calculation with ImageTasks."""
+        queue = TaskQueue()
+        queue.add(
+            ImageTask(
+                TaskType.DETECTION, tile_id=1, arrival_time=0.0, cloud_fraction=0.2
+            )
+        )
+        queue.add(
+            ImageTask(
+                TaskType.DETECTION, tile_id=2, arrival_time=0.0, cloud_fraction=0.4
+            )
+        )
+        queue.add(
+            ImageTask(TaskType.ANOMALY, tile_id=3, arrival_time=0.0, cloud_fraction=0.6)
+        )
+
+        avg_cloud = queue.get_avg_cloud_by_type()
+
+        assert avg_cloud[TaskType.DETECTION] == pytest.approx(0.3)  # (0.2 + 0.4) / 2
+        assert avg_cloud[TaskType.ANOMALY] == pytest.approx(0.6)
+        assert avg_cloud[TaskType.CLOUD_MASK] == pytest.approx(0.0)  # No tasks
+        assert avg_cloud[TaskType.COMPRESSION] == pytest.approx(0.0)
+
+    def test_get_avg_cloud_by_type_with_basic_tasks(self):
+        """Test average cloud fraction with basic Tasks (assumes 0.0)."""
+        queue = TaskQueue()
+        queue.add(Task(TaskType.DETECTION, tile_id=1, arrival_time=0.0))
+        queue.add(Task(TaskType.DETECTION, tile_id=2, arrival_time=0.0))
+
+        avg_cloud = queue.get_avg_cloud_by_type()
+
+        # Basic Tasks don't have cloud_fraction, should default to 0.0
+        assert avg_cloud[TaskType.DETECTION] == pytest.approx(0.0)
+
+    def test_get_avg_cloud_by_type_empty_queue(self):
+        """Test average cloud fraction with empty queue."""
+        queue = TaskQueue()
+        avg_cloud = queue.get_avg_cloud_by_type()
+
+        for task_type in TaskType:
+            assert avg_cloud[task_type] == pytest.approx(0.0)
+
+    def test_get_avg_quality_by_type_with_image_tasks(self):
+        """Test average quality multiplier calculation with ImageTasks."""
+        queue = TaskQueue()
+        # DETECTION with clear sky and high edges -> high quality
+        queue.add(
+            ImageTask(
+                TaskType.DETECTION,
+                tile_id=1,
+                arrival_time=0.0,
+                cloud_fraction=0.0,
+                entropy_score=0.5,
+                edge_density=1.0,
+            )
+        )
+        # CLOUD_MASK with high clouds -> quality based on cloud fraction
+        queue.add(
+            ImageTask(
+                TaskType.CLOUD_MASK,
+                tile_id=2,
+                arrival_time=0.0,
+                cloud_fraction=1.0,
+                entropy_score=0.5,
+                edge_density=0.5,
+            )
+        )
+
+        avg_quality = queue.get_avg_quality_by_type()
+
+        # DETECTION: (1-0) * (0.3*0.5 + 0.7*1.0) = 0.85
+        assert avg_quality[TaskType.DETECTION] == pytest.approx(0.85)
+        # CLOUD_MASK: 0.2 + 0.8 * 1.0 = 1.0
+        assert avg_quality[TaskType.CLOUD_MASK] == pytest.approx(1.0)
+        # Empty types should be 0.0
+        assert avg_quality[TaskType.ANOMALY] == pytest.approx(0.0)
+
+    def test_get_avg_quality_by_type_with_basic_tasks(self):
+        """Test average quality with basic Tasks (assumes 1.0)."""
+        queue = TaskQueue()
+        queue.add(Task(TaskType.DETECTION, tile_id=1, arrival_time=0.0))
+
+        avg_quality = queue.get_avg_quality_by_type()
+
+        # Basic Tasks have quality multiplier of 1.0
+        assert avg_quality[TaskType.DETECTION] == pytest.approx(1.0)
+
+    def test_get_avg_quality_by_type_mixed_tasks(self):
+        """Test average quality with mix of ImageTask and basic Task."""
+        queue = TaskQueue()
+        # ImageTask with quality ~0.5
+        queue.add(
+            ImageTask(
+                TaskType.DETECTION,
+                tile_id=1,
+                arrival_time=0.0,
+                cloud_fraction=0.5,
+                entropy_score=0.5,
+                edge_density=0.5,
+            )
+        )
+        # Basic Task with quality 1.0
+        queue.add(Task(TaskType.DETECTION, tile_id=2, arrival_time=0.0))
+
+        avg_quality = queue.get_avg_quality_by_type()
+
+        # ImageTask: (1-0.5) * (0.3*0.5 + 0.7*0.5) = 0.5 * 0.5 = 0.25
+        # Basic Task: 1.0
+        # Average: (0.25 + 1.0) / 2 = 0.625
+        assert avg_quality[TaskType.DETECTION] == pytest.approx(0.625)
+
+
+class TestImageTask:
+    """Tests for ImageTask dataclass."""
+
+    def test_image_task_creation(self):
+        task = ImageTask(
+            task_type=TaskType.DETECTION,
+            tile_id=42,
+            arrival_time=100.0,
+            cloud_fraction=0.3,
+            entropy_score=0.7,
+            edge_density=0.5,
+        )
+        assert task.task_type == TaskType.DETECTION
+        assert task.cloud_fraction == 0.3
+        assert task.entropy_score == 0.7
+        assert task.edge_density == 0.5
+
+    def test_image_task_defaults(self):
+        task = ImageTask(TaskType.DETECTION, tile_id=1, arrival_time=0.0)
+        assert task.cloud_fraction == 0.0
+        assert task.entropy_score == 0.5
+        assert task.edge_density == 0.5
+
+    def test_image_quality_multiplier_detection_clear(self):
+        """Clear sky with high edges -> high value for detection."""
+        task = ImageTask(
+            TaskType.DETECTION,
+            tile_id=1,
+            arrival_time=0.0,
+            cloud_fraction=0.0,
+            entropy_score=0.5,
+            edge_density=1.0,
+        )
+        # (1-0) * (0.3*0.5 + 0.7*1.0) = 0.85
+        assert task.image_quality_multiplier == pytest.approx(0.85)
+
+    def test_image_quality_multiplier_detection_cloudy(self):
+        """Cloudy image -> low value for detection."""
+        task = ImageTask(
+            TaskType.DETECTION,
+            tile_id=1,
+            arrival_time=0.0,
+            cloud_fraction=0.9,
+            entropy_score=0.5,
+            edge_density=0.5,
+        )
+        # (1-0.9) * (0.3*0.5 + 0.7*0.5) = 0.1 * 0.5 = 0.05 -> floor at 0.1
+        assert task.image_quality_multiplier == pytest.approx(0.1)
+
+    def test_image_quality_multiplier_cloud_mask(self):
+        """Cloud masking benefits from cloudy images."""
+        task = ImageTask(
+            TaskType.CLOUD_MASK,
+            tile_id=1,
+            arrival_time=0.0,
+            cloud_fraction=1.0,
+            entropy_score=0.5,
+            edge_density=0.5,
+        )
+        # 0.2 + 0.8 * 1.0 = 1.0
+        assert task.image_quality_multiplier == pytest.approx(1.0)
+
+    def test_image_quality_multiplier_compression(self):
+        """Compression benefits from high entropy."""
+        task = ImageTask(
+            TaskType.COMPRESSION,
+            tile_id=1,
+            arrival_time=0.0,
+            cloud_fraction=0.5,
+            entropy_score=1.0,
+            edge_density=0.5,
+        )
+        # 0.3 + 0.7 * 1.0 = 1.0
+        assert task.image_quality_multiplier == pytest.approx(1.0)
+
+    def test_current_value_includes_quality(self):
+        """Test that current_value applies image quality multiplier."""
+        task_clear = ImageTask(
+            TaskType.DETECTION,
+            tile_id=1,
+            arrival_time=0.0,
+            cloud_fraction=0.0,
+            entropy_score=0.5,
+            edge_density=1.0,
+        )
+        task_cloudy = ImageTask(
+            TaskType.DETECTION,
+            tile_id=2,
+            arrival_time=0.0,
+            cloud_fraction=0.9,
+            entropy_score=0.5,
+            edge_density=0.5,
+        )
+
+        value_clear = task_clear.current_value(0.0)
+        value_cloudy = task_cloudy.current_value(0.0)
+
+        # Clear image should have higher value
+        assert value_clear > value_cloudy
+        # Value ratio should match quality multiplier ratio
+        ratio = value_clear / value_cloudy
+        expected_ratio = (
+            task_clear.image_quality_multiplier / task_cloudy.image_quality_multiplier
+        )
+        assert ratio == pytest.approx(expected_ratio)

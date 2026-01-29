@@ -45,15 +45,16 @@ def get_contention_config() -> tuple[SatelliteConfig, EpisodeConfig]:
     PPO typically beats best baseline by >50%.
     """
     sat_config = SatelliteConfig(
-        compute_capacity=4.0,       # Constrained: creates real backlog
+        compute_capacity=4.0,  # Constrained: creates real backlog
         buffer_capacity=256.0,
         power_capacity=300.0,
         power_per_tops=5.0,
-        task_arrival_rate=12.0,     # High arrival: tasks queue and decay
+        task_arrival_rate=12.0,  # High arrival: tasks queue and decay
         priority_event_prob=0.05,
+        use_image_features=True,  # Extended obs space with image metrics
     )
     episode_config = EpisodeConfig(
-        max_steps=500,              # ~1.4 hours of sim time
+        max_steps=500,  # ~1.4 hours of sim time
         timestep_duration=10.0,
     )
     return sat_config, episode_config
